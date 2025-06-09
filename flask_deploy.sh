@@ -368,15 +368,19 @@ EOF
 create_subdirectory_nginx_config() {
     local config_file="$1"
     
-    if [[ -f "/etc/nginx/sites-available/default" ]] || [[ -f "/etc/nginx/sites-enabled/default" ]]; then
+    # For subdirectory deployment, we need to modify the default site or create a new one
+    if [[ -f "/etc/nginx/sites-available/default" ]] && [[ -f "/etc/nginx/sites-enabled/default" ]]; then
         # Modify existing default config
         print_warning "Adding subdirectory configuration to existing default site"
         
         # Backup existing config
         sudo cp /etc/nginx/sites-available/default "/etc/nginx/sites-available/default.backup.$(date +%Y%m%d_%H%M%S)"
         
-        # Add location block to existing config
-        sudo sed -i "/location \/ {/i\\
+        # Check if our location block already exists
+        if ! grep -q "location /$PROJECT_NAME/" /etc/nginx/sites-available/default; then
+            # Add location block to existing config before the main location / block
+            sudo sed -i "/location \/ {/i\\
+    # $PROJECT_NAME Flask application\\
     location /$PROJECT_NAME/ {\\
         rewrite ^/$PROJECT_NAME/(.*) /\$1 break;\\
         proxy_pass http://unix:$PROJECT_DIR/run/gunicorn.sock;\\
@@ -384,21 +388,54 @@ create_subdirectory_nginx_config() {
         proxy_set_header X-Real-IP \$remote_addr;\\
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\\
         proxy_set_header X-Forwarded-Proto \$scheme;\\
+        proxy_redirect off;\\
+        proxy_buffering off;\\
+    }\\
+\\
+    # $PROJECT_NAME static files\\
+    location /$PROJECT_NAME/static/ {\\
+        alias $PROJECT_DIR/static/;\\
+        expires 1y;\\
+        add_header Cache-Control \"public, immutable\";\\
     }\\
 " /etc/nginx/sites-available/default
+            
+            print_status "Added subdirectory configuration to default site"
+        else
+            print_warning "Subdirectory configuration already exists in default site"
+        fi
+        
+        # Don't create a separate enabled symlink for subdirectory mode
+        return 0
         
     else
-        # Create new config with subdirectory
+        # Create new config with subdirectory as main site
+        print_status "Creating new site configuration for subdirectory deployment"
+        
         sudo tee "$config_file" > /dev/null << EOF
 server {
     listen 80;
     server_name $DOMAIN_NAME;
     
+    # Security headers
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    
     server_tokens off;
     
     access_log /var/log/nginx/${PROJECT_NAME}_access.log;
     error_log /var/log/nginx/${PROJECT_NAME}_error.log;
+    
+    client_max_body_size 4M;
 
+    # Block common attack patterns
+    location ~* /(wp-admin|wp-login|phpmyadmin|admin|login|xmlrpc) {
+        deny all;
+        return 404;
+    }
+
+    # $PROJECT_NAME Flask application
     location /$PROJECT_NAME/ {
         rewrite ^/$PROJECT_NAME/(.*) /\$1 break;
         proxy_pass http://unix:$PROJECT_DIR/run/gunicorn.sock;
@@ -406,16 +443,28 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
     }
     
+    # $PROJECT_NAME static files
     location /$PROJECT_NAME/static/ {
         alias $PROJECT_DIR/static/;
         expires 1y;
+        add_header Cache-Control "public, immutable";
     }
     
-    location / {
+    # Root location for server info
+    location = / {
         return 200 "Server is running. Access your Flask app at /$PROJECT_NAME/";
         add_header Content-Type text/plain;
+    }
+    
+    # Default location for other paths
+    location / {
+        return 404;
     }
 }
 EOF
