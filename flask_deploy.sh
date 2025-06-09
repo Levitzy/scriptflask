@@ -391,8 +391,8 @@ create_subdirectory_nginx_config() {
         
         # Check if our location block already exists
         if ! grep -q "location /$PROJECT_NAME/" /etc/nginx/sites-available/default; then
-            # Add location block to existing config before the main location / block
-            sudo sed -i "/location \/ {/i\\
+            # Find the location / block and add our config before it
+            sudo sed -i "/^[[:space:]]*location[[:space:]]*\/[[:space:]]*{/i\\
     # $PROJECT_NAME Flask application\\
     location /$PROJECT_NAME/ {\\
         rewrite ^/$PROJECT_NAME/(.*) /\$1 break;\\
@@ -403,6 +403,8 @@ create_subdirectory_nginx_config() {
         proxy_set_header X-Forwarded-Proto \$scheme;\\
         proxy_redirect off;\\
         proxy_buffering off;\\
+        proxy_read_timeout 300s;\\
+        proxy_connect_timeout 75s;\\
     }\\
 \\
     # $PROJECT_NAME static files\\
@@ -471,16 +473,18 @@ server {
     
     # Root location for server info
     location = / {
-        return 200 "Server is running. Access your Flask app at /$PROJECT_NAME/";
+        return 200 "Server is running. Flask applications:\\n\\n- $PROJECT_NAME: http://$DOMAIN_NAME/$PROJECT_NAME/\\n";
         add_header Content-Type text/plain;
     }
     
     # Default location for other paths
     location / {
-        return 404;
+        return 404 "Page not found. Available applications:\\n\\n- $PROJECT_NAME: http://$DOMAIN_NAME/$PROJECT_NAME/\\n";
+        add_header Content-Type text/plain;
     }
 }
 EOF
+        return 1  # Signal that we created a new config file
     fi
 }
 
@@ -644,7 +648,7 @@ EOF
     sudo -u "$PROJECT_USER" chmod +x "$PROJECT_DIR/update.sh"
     
     # Create the main management script
-    tee "$SCRIPT_DIR/manage_$PROJECT_NAME.sh" > /dev/null << 'EOF'
+    tee "$SCRIPT_DIR/manage_$PROJECT_NAME.sh" > /dev/null << EOF
 #!/bin/bash
 
 # Flask Project Management Script
@@ -656,29 +660,487 @@ PROJECT_DIR="$PROJECT_DIR"
 DOMAIN_NAME="$DOMAIN_NAME"
 DEPLOYMENT_TYPE="$DEPLOYMENT_TYPE"
 NGINX_PORT="$NGINX_PORT"
+USE_SSL="$USE_SSL"
+SETUP_SECURITY="$SETUP_SECURITY"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 print_status() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    echo -e "\${GREEN}[INFO]\${NC} \$1"
 }
 
 print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "\${RED}[ERROR]\${NC} \$1"
 }
 
 print_header() {
     clear
-    echo -e "${PURPLE}========================================${NC}"
-    echo -e "${PURPLE}  Flask Project Management - $PROJECT_NAME${NC}"
-    echo -e "${PURPLE}========================================${NC}"
+    echo -e "\${PURPLE}========================================\${NC}"
+    echo -e "\${PURPLE}  Flask Project Management - \$PROJECT_NAME\${NC}"
+    echo -e "\${PURPLE}========================================\${NC}"
     echo ""
 }
+
+# Check if running with correct permissions
+check_permissions() {
+    if [[ \$EUID -eq 0 ]]; then
+        echo "Please run this script as a regular user with sudo privileges, not as root."
+        exit 1
+    fi
+    
+    if ! sudo -n true 2>/dev/null; then
+        echo "This script requires sudo privileges. Please run: sudo -v"
+        exit 1
+    fi
+}
+
+open_browser_url() {
+    print_header
+    echo "Open Project URLs in Browser"
+    echo "============================="
+    
+    # Determine URLs based on deployment type
+    local http_url=""
+    local https_url=""
+    
+    case "\$DEPLOYMENT_TYPE" in
+        "main")
+            http_url="http://\$DOMAIN_NAME/"
+            https_url="https://\$DOMAIN_NAME/"
+            ;;
+        "subdirectory")
+            http_url="http://\$DOMAIN_NAME/\$PROJECT_NAME/"
+            https_url="https://\$DOMAIN_NAME/\$PROJECT_NAME/"
+            ;;
+        "port")
+            http_url="http://\$DOMAIN_NAME:\$NGINX_PORT/"
+            https_url="https://\$DOMAIN_NAME:\$NGINX_PORT/"
+            ;;
+    esac
+    
+    echo -e "\${BLUE}Available URLs for \$PROJECT_NAME:\${NC}"
+    echo "----------------------------------------"
+    echo -e "1) \${GREEN}HTTP:\${NC}  \$http_url"
+    if [[ "\$USE_SSL" == "true" ]]; then
+        echo -e "2) \${GREEN}HTTPS:\${NC} \$https_url"
+    fi
+    echo ""
+    echo -e "\${CYAN}📋 Copy these URLs and paste them in your browser:\${NC}"
+    echo "\$http_url"
+    if [[ "\$USE_SSL" == "true" ]]; then
+        echo "\$https_url"
+    fi
+    
+    echo ""
+    echo -e "\${CYAN}🧪 Test commands:\${NC}"
+    echo "curl -v \$http_url"
+    if [[ "\$USE_SSL" == "true" ]]; then
+        echo "curl -v \$https_url"
+    fi
+    
+    # Test if URLs are accessible
+    echo ""
+    echo -e "\${BLUE}Quick URL Test:\${NC}"
+    echo "----------------------------------------"
+    
+    echo -n "Testing HTTP: "
+    local http_code=\$(curl -s -o /dev/null -w "%{http_code}" "\$http_url" 2>/dev/null || echo "000")
+    case \$http_code in
+        200) echo -e "\${GREEN}✓ OK (\$http_code)\${NC}" ;;
+        301|302) echo -e "\${YELLOW}↗ Redirect (\$http_code)\${NC}" ;;
+        404) echo -e "\${RED}✗ Not Found (\$http_code)\${NC}" ;;
+        500|502|503) echo -e "\${RED}✗ Server Error (\$http_code)\${NC}" ;;
+        000) echo -e "\${RED}✗ Connection Failed\${NC}" ;;
+        *) echo -e "\${YELLOW}? Unexpected (\$http_code)\${NC}" ;;
+    esac
+    
+    if [[ "\$USE_SSL" == "true" ]]; then
+        echo -n "Testing HTTPS: "
+        local https_code=\$(curl -s -o /dev/null -w "%{http_code}" "\$https_url" 2>/dev/null || echo "000")
+        case \$https_code in
+            200) echo -e "\${GREEN}✓ OK (\$https_code)\${NC}" ;;
+            301|302) echo -e "\${YELLOW}↗ Redirect (\$https_code)\${NC}" ;;
+            404) echo -e "\${RED}✗ Not Found (\$https_code)\${NC}" ;;
+            500|502|503) echo -e "\${RED}✗ Server Error (\$https_code)\${NC}" ;;
+            000) echo -e "\${RED}✗ Connection Failed\${NC}" ;;
+            *) echo -e "\${YELLOW}? Unexpected (\$https_code)\${NC}" ;;
+        esac
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+show_status() {
+    print_header
+    echo -e "\${BLUE}Project Status:\${NC}"
+    echo "----------------------------------------"
+    
+    # Service status
+    if sudo supervisorctl status "\$PROJECT_NAME" | grep -q "RUNNING"; then
+        echo -e "Service Status: \${GREEN}RUNNING\${NC}"
+        local pid=\$(sudo supervisorctl status "\$PROJECT_NAME" | grep -o 'pid [0-9]*' | cut -d' ' -f2)
+        local uptime=\$(sudo supervisorctl status "\$PROJECT_NAME" | grep -o 'uptime [^,]*' | cut -d' ' -f2-)
+        echo "Process ID: \$pid"
+        echo "Uptime: \$uptime"
+    else
+        echo -e "Service Status: \${RED}STOPPED\${NC}"
+    fi
+    
+    # Nginx status
+    if sudo systemctl is-active nginx >/dev/null 2>&1; then
+        echo -e "Nginx Status: \${GREEN}RUNNING\${NC}"
+    else
+        echo -e "Nginx Status: \${RED}STOPPED\${NC}"
+    fi
+    
+    # System resources
+    echo ""
+    echo -e "\${BLUE}System Resources:\${NC}"
+    echo "----------------------------------------"
+    local cpu_usage=\$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - \$1"%"}' 2>/dev/null || echo "N/A")
+    local memory_usage=\$(free | grep Mem | awk '{printf("%.1f%%", \$3/\$2 * 100.0)}' 2>/dev/null || echo "N/A")
+    local disk_usage=\$(df -h / | awk 'NR==2{print \$5}' 2>/dev/null || echo "N/A")
+    
+    echo "CPU Usage: \$cpu_usage"
+    echo "Memory Usage: \$memory_usage"
+    echo "Disk Usage: \$disk_usage"
+    
+    # URL information
+    echo ""
+    echo -e "\${BLUE}Access URLs:\${NC}"
+    echo "----------------------------------------"
+    case "\$DEPLOYMENT_TYPE" in
+        "main")
+            echo -e "🌐 \${GREEN}HTTP:\${NC}  http://\$DOMAIN_NAME/"
+            echo -e "🔒 \${GREEN}HTTPS:\${NC} https://\$DOMAIN_NAME/ \${YELLOW}(if SSL enabled)\${NC}"
+            echo ""
+            echo -e "\${CYAN}Test Commands:\${NC}"
+            echo "curl -I http://\$DOMAIN_NAME/"
+            echo "curl -I https://\$DOMAIN_NAME/"
+            ;;
+        "subdirectory")
+            echo -e "🌐 \${GREEN}HTTP:\${NC}  http://\$DOMAIN_NAME/\$PROJECT_NAME/"
+            echo -e "🔒 \${GREEN}HTTPS:\${NC} https://\$DOMAIN_NAME/\$PROJECT_NAME/ \${YELLOW}(if SSL enabled)\${NC}"
+            echo ""
+            echo -e "\${CYAN}Test Commands:\${NC}"
+            echo "curl -I http://\$DOMAIN_NAME/\$PROJECT_NAME/"
+            echo "curl -I https://\$DOMAIN_NAME/\$PROJECT_NAME/"
+            ;;
+        "port")
+            echo -e "🌐 \${GREEN}HTTP:\${NC}  http://\$DOMAIN_NAME:\$NGINX_PORT/"
+            echo -e "🔒 \${GREEN}HTTPS:\${NC} https://\$DOMAIN_NAME:\$NGINX_PORT/ \${YELLOW}(if SSL enabled)\${NC}"
+            echo ""
+            echo -e "\${CYAN}Test Commands:\${NC}"
+            echo "curl -I http://\$DOMAIN_NAME:\$NGINX_PORT/"
+            echo "curl -I https://\$DOMAIN_NAME:\$NGINX_PORT/"
+            ;;
+    esac
+    
+    # Project information
+    echo ""
+    echo -e "\${BLUE}Project Information:\${NC}"
+    echo "----------------------------------------"
+    echo "Project Name: \$PROJECT_NAME"
+    echo "Project User: \$PROJECT_USER"
+    echo "Project Directory: \$PROJECT_DIR"
+    
+    if cd "\$PROJECT_DIR" 2>/dev/null; then
+        echo "Git Repository: \$(git remote get-url origin 2>/dev/null || echo 'Not available')"
+        echo "Current Branch: \$(git branch --show-current 2>/dev/null || echo 'Not available')"
+        echo "Last Commit: \$(git log -1 --oneline 2>/dev/null || echo 'Not available')"
+    fi
+    
+    # Check application response
+    echo ""
+    echo -e "\${BLUE}Application Health Check:\${NC}"
+    echo "----------------------------------------"
+    
+    case "\$DEPLOYMENT_TYPE" in
+        "main") test_url="http://\$DOMAIN_NAME/" ;;
+        "subdirectory") test_url="http://\$DOMAIN_NAME/\$PROJECT_NAME/" ;;
+        "port") test_url="http://\$DOMAIN_NAME:\$NGINX_PORT/" ;;
+    esac
+    
+    local http_code=\$(curl -s -o /dev/null -w "%{http_code}" "\$test_url" 2>/dev/null || echo "000")
+    local response_time=\$(curl -s -o /dev/null -w "%{time_total}" "\$test_url" 2>/dev/null || echo "N/A")
+    
+    case \$http_code in
+        200) echo -e "HTTP Status: \${GREEN}\$http_code (OK)\${NC}" ;;
+        301|302) echo -e "HTTP Status: \${YELLOW}\$http_code (Redirect)\${NC}" ;;
+        404) echo -e "HTTP Status: \${RED}\$http_code (Not Found)\${NC}" ;;
+        500|502|503) echo -e "HTTP Status: \${RED}\$http_code (Server Error)\${NC}" ;;
+        000) echo -e "HTTP Status: \${RED}Connection Failed\${NC}" ;;
+        *) echo -e "HTTP Status: \${YELLOW}\$http_code\${NC}" ;;
+    esac
+    
+    if [[ "\$response_time" != "N/A" ]]; then
+        echo "Response Time: \${response_time}s"
+    fi
+    
+    echo ""
+    echo -e "\${BLUE}Recent Logs (last 5 lines):\${NC}"
+    echo "----------------------------------------"
+    sudo tail -5 "/var/log/\$PROJECT_NAME.log" 2>/dev/null || echo "No logs available"
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+restart_service() {
+    print_header
+    echo "Restarting \$PROJECT_NAME service..."
+    
+    sudo supervisorctl restart "\$PROJECT_NAME"
+    sleep 2
+    
+    if sudo supervisorctl status "\$PROJECT_NAME" | grep -q "RUNNING"; then
+        print_status "Service restarted successfully"
+    else
+        print_error "Service restart failed. Check logs for details."
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+view_logs() {
+    print_header
+    echo "Choose log type to view:"
+    echo "1) Application logs"
+    echo "2) Nginx access logs"
+    echo "3) Nginx error logs"
+    echo "4) Real-time application logs"
+    echo "5) Back to main menu"
+    echo ""
+    
+    read -p "Enter choice [1-5]: " log_choice
+    
+    case \$log_choice in
+        1)
+            sudo tail -50 "/var/log/\$PROJECT_NAME.log"
+            ;;
+        2)
+            sudo tail -50 "/var/log/nginx/\${PROJECT_NAME}_access.log" 2>/dev/null || echo "Access log not found"
+            ;;
+        3)
+            sudo tail -50 "/var/log/nginx/error.log"
+            ;;
+        4)
+            echo "Press Ctrl+C to stop real-time monitoring"
+            sudo tail -f "/var/log/\$PROJECT_NAME.log"
+            ;;
+        5)
+            return
+            ;;
+        *)
+            echo "Invalid choice"
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+update_project() {
+    print_header
+    echo "Updating project from Git repository..."
+    
+    # Run update script as project user
+    if sudo -u "\$PROJECT_USER" "\$PROJECT_DIR/update.sh"; then
+        echo ""
+        echo "Code updated successfully!"
+        echo ""
+        read -p "Restart service to apply changes? [Y/n]: " restart_choice
+        restart_choice=\${restart_choice:-y}
+        
+        if [[ "\$restart_choice" =~ ^[Yy] ]]; then
+            sudo supervisorctl restart "\$PROJECT_NAME"
+            print_status "Service restarted"
+        fi
+    else
+        print_error "Update failed. Check the output above for details."
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+manage_ssl() {
+    print_header
+    echo "SSL Certificate Management"
+    echo "1) Install/Renew SSL certificate"
+    echo "2) Check certificate status"
+    echo "3) Test certificate renewal"
+    echo "4) Back to main menu"
+    echo ""
+    
+    read -p "Enter choice [1-4]: " ssl_choice
+    
+    case \$ssl_choice in
+        1)
+            echo "Installing/Renewing SSL certificate..."
+            if sudo certbot --nginx -d "\$DOMAIN_NAME"; then
+                print_status "SSL certificate updated successfully"
+            else
+                print_error "SSL certificate installation failed"
+            fi
+            ;;
+        2)
+            sudo certbot certificates
+            ;;
+        3)
+            sudo certbot renew --dry-run
+            ;;
+        4)
+            return
+            ;;
+        *)
+            echo "Invalid choice"
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+manage_firewall() {
+    print_header
+    echo "Firewall Management"
+    echo "1) Check firewall status"
+    echo "2) Check Fail2Ban status"
+    echo "3) Unban IP address"
+    echo "4) Back to main menu"
+    echo ""
+    
+    read -p "Enter choice [1-4]: " fw_choice
+    
+    case \$fw_choice in
+        1)
+            sudo ufw status verbose
+            ;;
+        2)
+            sudo fail2ban-client status
+            echo ""
+            sudo fail2ban-client status "nginx-\$PROJECT_NAME" 2>/dev/null || echo "No bans for this project"
+            ;;
+        3)
+            read -p "Enter IP address to unban: " ip_address
+            if [[ -n "\$ip_address" ]]; then
+                sudo fail2ban-client set "nginx-\$PROJECT_NAME" unbanip "\$ip_address" 2>/dev/null || echo "IP not found or already unbanned"
+            fi
+            ;;
+        4)
+            return
+            ;;
+        *)
+            echo "Invalid choice"
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+backup_project() {
+    print_header
+    echo "Creating project backup..."
+    
+    BACKUP_FILE="/tmp/\${PROJECT_NAME}_backup_\$(date +%Y%m%d_%H%M%S).tar.gz"
+    
+    sudo tar -czf "\$BACKUP_FILE" -C "/home/\$PROJECT_USER" "\$PROJECT_NAME" 2>/dev/null
+    
+    if [[ -f "\$BACKUP_FILE" ]]; then
+        print_status "Backup created: \$BACKUP_FILE"
+        echo "Backup size: \$(du -h "\$BACKUP_FILE" | cut -f1)"
+    else
+        print_error "Backup creation failed"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+quick_health_check() {
+    print_header
+    echo "Quick Health Check:"
+    echo "==================="
+    
+    # Service check
+    if sudo supervisorctl status "\$PROJECT_NAME" | grep -q "RUNNING"; then
+        echo -e "✓ Service is \${GREEN}running\${NC}"
+    else
+        echo -e "✗ Service is \${RED}not running\${NC}"
+    fi
+    
+    # HTTP check
+    case "\$DEPLOYMENT_TYPE" in
+        "main") url="http://\$DOMAIN_NAME/" ;;
+        "subdirectory") url="http://\$DOMAIN_NAME/\$PROJECT_NAME/" ;;
+        "port") url="http://\$DOMAIN_NAME:\$NGINX_PORT/" ;;
+    esac
+    
+    if curl -s -o /dev/null -w "%{http_code}" "\$url" | grep -q "200\|301\|302"; then
+        echo -e "✓ Application is \${GREEN}responding\${NC}"
+    else
+        echo -e "✗ Application is \${RED}not responding\${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+main_menu() {
+    while true; do
+        print_header
+        echo "Choose an option:"
+        echo ""
+        echo "1)  📊 Show detailed project status"
+        echo "2)  🌐 Open project URLs (Copy & Test)"
+        echo "3)  🔄 Restart service"
+        echo "4)  📝 View logs"
+        echo "5)  🔄 Update project from Git"
+        echo "6)  🔒 SSL certificate management"
+        echo "7)  🛡️  Firewall management"
+        echo "8)  💾 Create backup"
+        echo "9)  ⚡ Quick health check"
+        echo "10) 🚪 Exit"
+        echo ""
+        
+        read -p "Enter your choice [1-10]: " choice
+        
+        case \$choice in
+            1) show_status ;;
+            2) open_browser_url ;;
+            3) restart_service ;;
+            4) view_logs ;;
+            5) update_project ;;
+            6) manage_ssl ;;
+            7) manage_firewall ;;
+            8) backup_project ;;
+            9) quick_health_check ;;
+            10) 
+                echo "Goodbye!"
+                exit 0
+                ;;
+            *) 
+                echo "Invalid choice. Please try again."
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+# Main execution
+check_permissions
+main_menu
+EOF
 
 show_status() {
     print_header
